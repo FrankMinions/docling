@@ -1,6 +1,7 @@
 import copy
 import logging
 import warnings
+import concurrent.futures
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional
@@ -76,6 +77,7 @@ class LayoutModel(BasePageModel):
             num_threads=accelerator_options.num_threads,
         )
         self.batch_size = 8
+        self.max_workers = 8
 
     @staticmethod
     def download_models(
@@ -168,8 +170,8 @@ class LayoutModel(BasePageModel):
                 # Batch prediction based on layout model
                 predictions_batch = self.layout_predictor.batch_predict(page_images, batch_size=self.batch_size)
 
-                # Process the prediction results for each page
-                for page, predictions in zip(valid_pages, predictions_batch):
+                def process_page_predictions(args):
+                    page, predictions = args
                     clusters = []
                     for ix, pred_item in enumerate(predictions):
                         label = DocItemLabel(
@@ -207,5 +209,15 @@ class LayoutModel(BasePageModel):
                             conv_res, page, processed_clusters, mode_prefix="postprocessed"
                         )
 
+                    return page
+
+                # Use thread pool to parallelize post-processing
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    processed_pages = list(executor.map(
+                        process_page_predictions,
+                        zip(valid_pages, predictions_batch)
+                    ))
+
+                # Return to the processed page
+                for page in processed_pages:
                     yield page
-                    
