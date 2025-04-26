@@ -75,6 +75,7 @@ class LayoutModel(BasePageModel):
             device=device,
             num_threads=accelerator_options.num_threads,
         )
+        self.batch_size = 8
 
     @staticmethod
     def download_models(
@@ -141,28 +142,42 @@ class LayoutModel(BasePageModel):
             combined_image.save(str(out_file), format="png")
 
     def __call__(
-        self, conv_res: ConversionResult, page_batch: Iterable[Page]
+            self, conv_res: ConversionResult, page_batch: Iterable[Page]
     ) -> Iterable[Page]:
-        for page in page_batch:
+        # Convert page batches to lists for multiple iterations
+        pages = list(page_batch)
+
+        # Collect all valid pages and images
+        valid_pages = []
+        page_images = []
+
+        for page in pages:
             assert page._backend is not None
             if not page._backend.is_valid():
                 yield page
             else:
-                with TimeRecorder(conv_res, "layout"):
-                    assert page.size is not None
-                    page_image = page.get_image(scale=1.0)
-                    assert page_image is not None
+                assert page.size is not None
+                page_image = page.get_image(scale=1.0)
+                assert page_image is not None
+                valid_pages.append(page)
+                page_images.append(page_image)
 
+        # Batch process if there are valid pages
+        if valid_pages:
+            with TimeRecorder(conv_res, "layout"):
+                # Batch prediction based on layout model
+                predictions_batch = self.layout_predictor.batch_predict(page_images, batch_size=self.batch_size)
+
+                # Process the prediction results for each page
+                for page, predictions in zip(valid_pages, predictions_batch):
                     clusters = []
-                    for ix, pred_item in enumerate(
-                        self.layout_predictor.predict(page_image)
-                    ):
+                    for ix, pred_item in enumerate(predictions):
                         label = DocItemLabel(
                             pred_item["label"]
                             .lower()
                             .replace(" ", "_")
                             .replace("-", "_")
-                        )  # Temporary, until docling-ibm-model uses docling-core types
+                        )
                         cluster = Cluster(
                             id=ix,
                             label=label,
@@ -177,21 +192,20 @@ class LayoutModel(BasePageModel):
                             conv_res, page, clusters, mode_prefix="raw"
                         )
 
-                    # Apply postprocessing
-
+                    # Apply post-processing
                     processed_clusters, processed_cells = LayoutPostprocessor(
                         page.cells, clusters, page.size
                     ).postprocess()
-                    # processed_clusters, processed_cells = clusters, page.cells
 
                     page.cells = processed_cells
                     page.predictions.layout = LayoutPrediction(
                         clusters=processed_clusters
                     )
 
-                if settings.debug.visualize_layout:
-                    self.draw_clusters_and_cells_side_by_side(
-                        conv_res, page, processed_clusters, mode_prefix="postprocessed"
-                    )
+                    if settings.debug.visualize_layout:
+                        self.draw_clusters_and_cells_side_by_side(
+                            conv_res, page, processed_clusters, mode_prefix="postprocessed"
+                        )
 
-                yield page
+                    yield page
+                    
